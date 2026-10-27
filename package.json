@@ -1,0 +1,17 @@
+{
+  "name": "driverhub",
+  "version": "0.1.0",
+  "description": "DriverHub — управление драйверами и диагностика Linux",
+  "main": "src/main.cjs",
+  "author": "DriverHub",
+  "license": "MIT",
+  "private": true,
+  "scripts": {
+    "start": "electron --no-sandbox .",
+    "test": "node --test test/**/*.test.cjs",
+    "check": "node --check src/main.cjs && node --check src/preload.cjs && node --check src/renderer/app.js"
+  },
+  "devDependencies": {
+    "electron": "^32.2.7"
+  }
+}
