@@ -295,5 +295,95 @@ test('AI diagnostic output formatting safely parses raw and partial JSON', () =>
   assert.match(styles, /\.rec-number-badge/);
 });
 
+test('Hardware diagnostic report generation produces detailed Markdown and includes telemetry, devices and checks', () => {
+  const { generateSystemReport } = require('../src/main.cjs');
+  const sampleInfo = {
+    distribution: 'Astra Linux Special Edition',
+    kernel: '5.15.0-70-generic',
+    architecture: 'x64',
+    hostname: 'astra-station',
+    displayServer: 'Wayland',
+    desktopEnv: 'Fly Desktop',
+    soundServer: 'PipeWire',
+    userInLpGroup: true,
+    rebootRequired: false
+  };
+  const sampleDevices = [
+    { name: 'Canon LBP2900', category: 'printer', driver: 'capt', status: 'ok', statusText: 'Работает (capt)', recommendation: null },
+    { name: 'NVIDIA GeForce RTX 4070', category: 'graphics', driver: 'nouveau', status: 'problem', statusText: 'Драйвер открытый', recommendation: { name: 'nvidia-driver' } }
+  ];
+  const sampleIssues = [
+    { severity: 'warning', title: 'Рекомендуется проприетарный драйвер NVIDIA', description: 'Для ускорения 3D графики установите nvidia-driver', action: 'Установить nvidia-driver' }
+  ];
+  const sampleLogs = [
+    { timestamp: '2026-10-27T18:00:00Z', type: 'scan', status: 'ok', summary: 'Сканирование 2 устройств' }
+  ];
+
+  const report = generateSystemReport(sampleInfo, sampleDevices, sampleIssues, sampleLogs);
+  assert.match(report, /# Отчёт об оборудовании и драйверах — DriverHub Linux/);
+  assert.match(report, /Astra Linux Special Edition/);
+  assert.match(report, /Wayland/);
+  assert.match(report, /PipeWire/);
+  assert.match(report, /Canon LBP2900/);
+  assert.match(report, /nvidia-driver/);
+  assert.match(report, /Рекомендуется проприетарный драйвер NVIDIA/);
+  assert.match(report, /Таблица оборудования/);
+});
+
+test('Composite USB device categorization and sysfs fallback scanning are supported', () => {
+  const { parseLsusb, scanSysfsPci, scanSysfsUsb } = require('../src/main.cjs');
+  const lsusbOut = 'Bus 001 Device 004: ID a69c:8d81 AICSemi AIC 8800D80\n';
+  const treeOut = '/:  Bus 01.Port 1: Dev 1, Class=root_hub, Driver=xhci_hcd/1p, 480M\n    |__ Port 1: Dev 4, If 0, Class=Wireless, Driver=aic8800_fdrv, 480M\n';
+  
+  const parsed = parseLsusb(lsusbOut, treeOut, 'linux');
+  assert.equal(parsed.length, 1);
+  assert.equal(parsed[0].category, 'network');
+  assert.equal(parsed[0].driver, 'aic8800_fdrv');
+  assert.equal(parsed[0].status, 'ok');
+
+  // Verify sysfs scanners return arrays without throwing errors
+  const pciDevices = scanSysfsPci('linux');
+  assert.ok(Array.isArray(pciDevices));
+
+  const usbDevices = scanSysfsUsb('linux');
+  assert.ok(Array.isArray(usbDevices));
+});
+
+test('Interactive category filter chips, status filtering, and 1-Click QuickFix matrix are integrated', () => {
+  const main = read('src/main.cjs');
+  const preload = read('src/preload.cjs');
+  const app = read('src/renderer/app.js');
+  const styles = read('src/renderer/styles.css');
+
+  // IPC & Preload APIs
+  assert.match(main, /system:export-report/);
+  assert.match(main, /system:save-report/);
+  assert.match(main, /system:quick-fix/);
+  assert.match(preload, /exportReport/);
+  assert.match(preload, /saveReport/);
+  assert.match(preload, /quickFix/);
+
+  // Renderer UI components
+  assert.match(app, /filter-chips-row/);
+  assert.match(app, /filter-chip/);
+  assert.match(app, /filter-status-select/);
+  assert.match(app, /quickfix-section/);
+  assert.match(app, /data-quickfix="apt_locks"/);
+  assert.match(app, /data-quickfix="restart_cups"/);
+  assert.match(app, /data-quickfix="restart_ccpd"/);
+  assert.match(app, /data-quickfix="reload_udev"/);
+  assert.match(app, /data-quickfix="unblock_rfkill"/);
+  assert.match(app, /renderReportModal/);
+  assert.match(app, /telemetry-bar/);
+
+  // CSS rules
+  assert.match(styles, /\.filter-chips-row/);
+  assert.match(styles, /\.filter-chip\.active/);
+  assert.match(styles, /\.quickfix-grid/);
+  assert.match(styles, /\.quickfix-card/);
+  assert.match(styles, /\.report-modal/);
+  assert.match(styles, /\.telemetry-bar/);
+});
+
 
 

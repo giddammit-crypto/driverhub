@@ -33,7 +33,12 @@ const state = {
   showApiKey: false,
   testStatus: null,
   rebootRequired: false,
-  rebootDetails: null
+  rebootDetails: null,
+  selectedCategory: 'all',
+  selectedStatus: 'all',
+  reportModalOpen: false,
+  reportContent: '',
+  quickFixRunning: false
 };
 
 const BRAND_ICONS = {
@@ -524,6 +529,83 @@ function renderRebootModal(packageName = '', deviceName = '') {
   });
 }
 
+async function openReportModal() {
+  toast('Формирование диагностического отчёта…', 'info');
+  try {
+    const res = await window.driverHub.system.exportReport();
+    state.reportContent = res.markdown || '# Отчёт DriverHub Linux\nУстройства не найдены.';
+    state.reportModalOpen = true;
+    renderReportModal();
+  } catch (err) {
+    toast(`Ошибка экспорта отчёта: ${err.message}`, 'error');
+  }
+}
+
+function renderReportModal() {
+  const root = el('#modal-root');
+  if (!root) return;
+  if (!state.reportModalOpen) {
+    root.innerHTML = '';
+    return;
+  }
+
+  root.innerHTML = `
+    <div class="modal-backdrop" id="report-modal-backdrop">
+      <div class="modal report-modal" onclick="event.stopPropagation()">
+        <button class="modal-close" id="btn-close-report-x" aria-label="Закрыть">×</button>
+        <div class="report-modal-header">
+          <div class="modal-symbol">${brandIcon('description', 28)}</div>
+          <div>
+            <h2>Диагностический отчёт оборудования</h2>
+            <p>Сводная информация о системе, ядре, шинах PCI/USB, звуке, графике и модулях драйверов</p>
+          </div>
+        </div>
+        <div class="report-code-box">
+          <pre>${escapeHtml(state.reportContent || 'Загрузка отчёта…')}</pre>
+        </div>
+        <div class="modal-actions">
+          <button class="btn btn-secondary" id="btn-close-report">Закрыть</button>
+          <button class="btn btn-secondary" id="btn-copy-report">
+            ${brandIcon('check', 14)} &nbsp; Скопировать в буфер
+          </button>
+          <button class="btn btn-primary" id="btn-save-report">
+            ${brandIcon('download', 14)} &nbsp; Сохранить в файл (~/driverhub-report.md)
+          </button>
+        </div>
+      </div>
+    </div>
+  `;
+
+  const closeReport = () => {
+    state.reportModalOpen = false;
+    root.innerHTML = '';
+  };
+
+  el('#btn-close-report-x')?.addEventListener('click', closeReport);
+  el('#btn-close-report')?.addEventListener('click', closeReport);
+  el('#report-modal-backdrop')?.addEventListener('click', (e) => {
+    if (e.target.id === 'report-modal-backdrop') closeReport();
+  });
+
+  el('#btn-copy-report')?.addEventListener('click', async () => {
+    try {
+      await navigator.clipboard.writeText(state.reportContent);
+      toast('Отчёт скопирован в буфер обмена', 'success');
+    } catch {
+      toast('Не удалось скопировать в буфер', 'error');
+    }
+  });
+
+  el('#btn-save-report')?.addEventListener('click', async () => {
+    try {
+      const res = await window.driverHub.system.saveReport({ content: state.reportContent });
+      toast(`Отчёт успешно сохранён: ${res.filePath}`, 'success');
+    } catch (err) {
+      toast(`Ошибка сохранения: ${err.message}`, 'error');
+    }
+  });
+}
+
 function rebootBanner() {
   const isReboot = state.rebootRequired || state.devices.some(d => d.rebootRequired || d.status === 'warning' || (d.statusText && d.statusText.includes('перезагрузка')));
   if (!isReboot) return '';
@@ -661,6 +743,29 @@ function homePage() {
       <div class="sub">${updatesCount ? 'Доступны пакеты к установке' : 'Все драйверы настроены'}</div>
     </div>
   </div>
+  <div class="telemetry-bar">
+    <div class="telemetry-items">
+      <div class="telemetry-item">
+        <span class="telemetry-label">${brandIcon('monitor', 14)} &nbsp; ОС и рабочий стол</span>
+        <strong>${escapeHtml(state.system?.distribution || 'Linux')} (${escapeHtml(state.system?.desktopEnv || 'Desktop')})</strong>
+      </div>
+      <div class="telemetry-item">
+        <span class="telemetry-label">${brandIcon('cpu', 14)} &nbsp; Ядро и графика</span>
+        <strong>${escapeHtml(state.system?.kernel || 'Linux')} / ${escapeHtml(state.system?.displayServer || 'Wayland')}</strong>
+      </div>
+      <div class="telemetry-item">
+        <span class="telemetry-label">${brandIcon('volume', 14)} &nbsp; Звук и память</span>
+        <strong>${escapeHtml(state.system?.soundServer || 'ALSA')} • ${escapeHtml(state.system?.memory || 'ОЗУ')}</strong>
+      </div>
+      <div class="telemetry-item">
+        <span class="telemetry-label">${brandIcon('refresh', 14)} &nbsp; Время работы</span>
+        <strong>${escapeHtml(state.system?.uptime || '—')}</strong>
+      </div>
+    </div>
+    <button class="btn btn-secondary btn-small" data-action="export-report">
+      ${brandIcon('description', 14)} &nbsp; Отчёт оборудования
+    </button>
+  </div>
   <div class="quick-grid">
     <button class="quick-card blue" data-page="search">
       <span class="quick-icon">${brandIcon('search', 24)}</span>
@@ -709,8 +814,92 @@ function renderDriverResults(devices) {
 }
 
 function searchPage() {
-  const filtered = state.devices.filter((device) => `${device.name} ${device.category} ${device.driver || ''}`.toLowerCase().includes(state.query.toLowerCase()));
-  return `<div class="page-title"><div><span class="eyebrow">КАТАЛОГ СОВМЕСТИМОСТИ</span><h1>Поиск драйверов</h1><p>Проверьте оборудование и найдите подходящие пакеты из репозиториев системы.</p></div><button class="btn btn-primary" data-action="scan" ${state.scanning ? 'disabled' : ''}>${brandIcon('refresh', 16)} &nbsp; ${state.scanning ? 'Сканирование…' : 'Обновить список'}</button></div>${rebootBanner()}${canonBanner()}<div class="search-bar"><span>${brandIcon('search', 20)}</span><input id="driver-search" value="${escapeHtml(state.query)}" placeholder="Поиск по устройству, производителю или драйверу (например: Canon, LBP, Wi-Fi)..." /><span class="filter-pill">Все устройства⌄</span></div><div class="driver-results">${renderDriverResults(filtered)}</div>`;
+  const categoryNames = {
+    all: 'Все',
+    graphics: 'Видеокарты',
+    network: 'Сеть и Wi-Fi',
+    audio: 'Звук',
+    printer: 'Принтеры',
+    bluetooth: 'Bluetooth',
+    storage: 'Накопители',
+    input: 'Ввод / USB',
+    other: 'Другое'
+  };
+
+  const currentCategory = state.selectedCategory || 'all';
+  const currentStatus = state.selectedStatus || 'all';
+
+  const categoryCounts = { all: state.devices.length };
+  for (const d of state.devices) {
+    const cat = d.category || 'other';
+    categoryCounts[cat] = (categoryCounts[cat] || 0) + 1;
+  }
+
+  const filtered = state.devices.filter((device) => {
+    const textMatch = `${device.name} ${device.category} ${device.driver || ''} ${device.detail || ''}`.toLowerCase().includes(state.query.toLowerCase());
+    const categoryMatch = currentCategory === 'all' || device.category === currentCategory;
+    let statusMatch = true;
+    if (currentStatus === 'problem') {
+      statusMatch = device.status === 'problem' || Boolean(device.recommendation) || Boolean(device.rebootRequired);
+    } else if (currentStatus === 'ok') {
+      statusMatch = device.status === 'ok' && !device.recommendation;
+    }
+    return textMatch && categoryMatch && statusMatch;
+  });
+
+  const availableCategories = ['all', 'graphics', 'network', 'audio', 'printer', 'bluetooth', 'storage', 'input', 'other']
+    .filter((cat) => cat === 'all' || (categoryCounts[cat] && categoryCounts[cat] > 0));
+
+  return `
+    <div class="page-title">
+      <div>
+        <span class="eyebrow">КАТАЛОГ СОВМЕСТИМОСТИ</span>
+        <h1>Поиск драйверов</h1>
+        <p>Интерактивная фильтрация оборудования, проверка модулей ядра и пакетов системы.</p>
+      </div>
+      <div class="page-title-actions">
+        <button class="btn btn-secondary" data-action="export-report">
+          ${brandIcon('description', 16)} &nbsp; Отчёт оборудования
+        </button>
+        <button class="btn btn-primary" data-action="scan" ${state.scanning ? 'disabled' : ''}>
+          ${brandIcon('refresh', 16)} &nbsp; ${state.scanning ? 'Сканирование…' : 'Обновить список'}
+        </button>
+      </div>
+    </div>
+    ${rebootBanner()}
+    ${canonBanner()}
+    <div class="search-bar">
+      <span>${brandIcon('search', 20)}</span>
+      <input id="driver-search" value="${escapeHtml(state.query)}" placeholder="Поиск по устройству, производителю или драйверу (например: Canon, LBP, Wi-Fi, Realtek, NVIDIA)..." />
+      <span class="filter-status-select-wrap">
+        <select id="filter-status-select" class="filter-status-select" aria-label="Фильтр статуса">
+          <option value="all" ${currentStatus === 'all' ? 'selected' : ''}>Все статусы (${state.devices.length})</option>
+          <option value="problem" ${currentStatus === 'problem' ? 'selected' : ''}>Требуют внимания (${state.devices.filter(d => d.status === 'problem' || d.recommendation).length})</option>
+          <option value="ok" ${currentStatus === 'ok' ? 'selected' : ''}>Работают корректно (${state.devices.filter(d => d.status === 'ok' && !d.recommendation).length})</option>
+        </select>
+      </span>
+    </div>
+    <div class="filter-chips-row">
+      ${availableCategories.map((cat) => {
+        const isActive = cat === currentCategory;
+        const iconName = cat === 'all' ? 'search' : categoryIconName(cat);
+        const count = categoryCounts[cat] || 0;
+        return `
+          <button class="filter-chip ${isActive ? 'active' : ''}" data-category="${cat}">
+            ${brandIcon(iconName, 14)} &nbsp; ${categoryNames[cat] || cat}
+            <span class="filter-chip-count">${count}</span>
+          </button>
+        `;
+      }).join('')}
+    </div>
+    <div class="driver-results-meta">
+      <span>Показано: <b>${filtered.length}</b> из <b>${state.devices.length}</b> устройств</span>
+      ${(currentCategory !== 'all' || currentStatus !== 'all' || state.query) ? `
+        <button class="btn-link" data-action="reset-filters">Сбросить фильтры</button>
+      ` : ''}
+    </div>
+    <div class="driver-results">${renderDriverResults(filtered)}</div>
+  `;
 }
 
 function installPage() {
@@ -1014,11 +1203,22 @@ function repairPage() {
           <p>${system.text}</p>
           <div class="diagnostic-telemetry-tags">
             <span class="diag-tag">
-              ${brandIcon('monitor', 13)} &nbsp; ${escapeHtml(state.system?.distribution || 'Astra Linux')}
+              ${brandIcon('monitor', 13)} &nbsp; ${escapeHtml(state.system?.distribution || 'Astra Linux')} (${escapeHtml(state.system?.desktopEnv || 'Desktop')})
             </span>
             <span class="diag-tag">
               ${brandIcon('cpu', 13)} &nbsp; Ядро: ${escapeHtml(state.system?.kernel || 'Linux')}
             </span>
+            <span class="diag-tag">
+              ${brandIcon('monitor', 13)} &nbsp; Графика: ${escapeHtml(state.system?.displayServer || 'Wayland')}
+            </span>
+            <span class="diag-tag">
+              ${brandIcon('volume', 13)} &nbsp; Звук: ${escapeHtml(state.system?.soundServer || 'PipeWire')}
+            </span>
+            ${state.system?.memory ? `
+              <span class="diag-tag">
+                ${brandIcon('cpu', 13)} &nbsp; ОЗУ: ${escapeHtml(state.system.memory)}
+              </span>
+            ` : ''}
             <span class="diag-tag ${lpConfigured ? 'good' : 'bad'}">
               ${brandIcon(lpConfigured ? 'check' : 'alert', 13)} &nbsp; Группа lp: ${lpConfigured ? 'Включён ✓' : 'Не включён ⚠'}
             </span>
@@ -1083,6 +1283,98 @@ function repairPage() {
     </div>
 
     ${canonBanner()}
+
+    <!-- QuickFix Express Matrix -->
+    <section class="quickfix-section">
+      <div class="section-title">
+        <div>
+          <h2>Экспресс-восстановление ядра и подсистем (1-Click QuickFix)</h2>
+          <p>Мгновенное решение типовых проблем с драйверами, блокировками и демонами служб</p>
+        </div>
+        <button class="btn btn-secondary btn-small" data-action="export-report">
+          ${brandIcon('description', 14)} &nbsp; Отчёт оборудования
+        </button>
+      </div>
+      <div class="quickfix-grid">
+        <div class="quickfix-card">
+          <div class="quickfix-head">
+            <span class="quickfix-icon">${brandIcon('package', 22)}</span>
+            <div>
+              <strong>Снять блокировки APT / dpkg</strong>
+              <small>Устраняет зависание процессов apt, stale-блокировки в /var/lib/dpkg/lock и донастраивает пакеты</small>
+            </div>
+          </div>
+          <button class="btn btn-secondary btn-small" data-quickfix="apt_locks" ${state.quickFixRunning ? 'disabled' : ''}>
+            ${brandIcon('bolt', 14)} &nbsp; Снять блокировки
+          </button>
+        </div>
+
+        <div class="quickfix-card">
+          <div class="quickfix-head">
+            <span class="quickfix-icon">${brandIcon('printer', 22)}</span>
+            <div>
+              <strong>Перезапуск службы печати CUPS</strong>
+              <small>Перезапускает демоны cupsd, перечитывает конфигурацию PPD и очереди печати</small>
+            </div>
+          </div>
+          <button class="btn btn-secondary btn-small" data-quickfix="restart_cups" ${state.quickFixRunning ? 'disabled' : ''}>
+            ${brandIcon('refresh', 14)} &nbsp; Перезапустить CUPS
+          </button>
+        </div>
+
+        <div class="quickfix-card">
+          <div class="quickfix-head">
+            <span class="quickfix-icon">${brandIcon('printer', 22)}</span>
+            <div>
+              <strong>Перезапуск службы Canon CAPT (CCPD)</strong>
+              <small>Перезапускает демон связи ccpd и освобождает сокет FIFO /var/ccpd/fifo0</small>
+            </div>
+          </div>
+          <button class="btn btn-secondary btn-small" data-quickfix="restart_ccpd" ${state.quickFixRunning ? 'disabled' : ''}>
+            ${brandIcon('refresh', 14)} &nbsp; Перезапустить CCPD
+          </button>
+        </div>
+
+        <div class="quickfix-card">
+          <div class="quickfix-head">
+            <span class="quickfix-icon">${brandIcon('cpu', 22)}</span>
+            <div>
+              <strong>Перезагрузка правил udev и шин</strong>
+              <small>Выполняет udevadm control --reload-rules и udevadm trigger для повторной привязки драйверов</small>
+            </div>
+          </div>
+          <button class="btn btn-secondary btn-small" data-quickfix="reload_udev" ${state.quickFixRunning ? 'disabled' : ''}>
+            ${brandIcon('bolt', 14)} &nbsp; Перезагрузить udev
+          </button>
+        </div>
+
+        <div class="quickfix-card">
+          <div class="quickfix-head">
+            <span class="quickfix-icon">${brandIcon('network', 22)}</span>
+            <div>
+              <strong>Разблокировка радиомодулей (rfkill)</strong>
+              <small>Снимает программную блокировку адаптеров Wi-Fi и Bluetooth (rfkill unblock all)</small>
+            </div>
+          </div>
+          <button class="btn btn-secondary btn-small" data-quickfix="unblock_rfkill" ${state.quickFixRunning ? 'disabled' : ''}>
+            ${brandIcon('bolt', 14)} &nbsp; Разблокировать rfkill
+          </button>
+        </div>
+
+        <div class="quickfix-card highlight">
+          <div class="quickfix-head">
+            <span class="quickfix-icon">${brandIcon('description', 22)}</span>
+            <div>
+              <strong>Полный отчёт оборудования и модулей</strong>
+              <small>Формирует подробный диагностический файл с информацией обо всех устройствах и шинах</small>
+            </div>
+          </div>
+          <button class="btn btn-purple btn-small" data-action="export-report">
+            ${brandIcon('download', 14)} &nbsp; Сформировать отчёт
+          </button>
+        </div>
+      </div>
+    </section>
 
     <!-- Issues List or Interactive Repair Center -->
     ${state.issues.length ? `
@@ -2077,21 +2369,99 @@ function bindActions() {
     }
   });
 
+  // Interactive category filter chips
+  document.querySelectorAll('.filter-chip').forEach((button) => button.addEventListener('click', () => {
+    state.selectedCategory = button.dataset.category || 'all';
+    render();
+  }));
+
+  // Status dropdown filter
+  el('#filter-status-select')?.addEventListener('change', (e) => {
+    state.selectedStatus = e.target.value;
+    render();
+  });
+
+  // Reset filters
+  document.querySelectorAll('[data-action="reset-filters"]').forEach((button) => button.addEventListener('click', () => {
+    state.selectedCategory = 'all';
+    state.selectedStatus = 'all';
+    state.query = '';
+    render();
+  }));
+
+  // Export hardware & system diagnostics report
+  document.querySelectorAll('[data-action="export-report"]').forEach((button) => button.addEventListener('click', () => {
+    openReportModal();
+  }));
+
+  // 1-Click QuickFix actions
+  document.querySelectorAll('[data-quickfix]').forEach((button) => button.addEventListener('click', async () => {
+    const fixType = button.dataset.quickfix;
+    if (!fixType || state.quickFixRunning) return;
+    state.quickFixRunning = true;
+    button.disabled = true;
+    const originalText = button.innerHTML;
+    button.innerHTML = '<span class="spinner" style="width: 12px; height: 12px; border-width: 2px;"></span> &nbsp; Выполнение...';
+    toast('Применение экспресс-исправления...', 'info');
+    try {
+      const res = await window.driverHub.system.quickFix(fixType);
+      toast(res.message || 'Действие выполнено успешно', 'success');
+      diagnose();
+    } catch (err) {
+      toast(`Ошибка быстрого исправления: ${err.message}`, 'error');
+    } finally {
+      state.quickFixRunning = false;
+      button.disabled = false;
+      button.innerHTML = originalText;
+    }
+  }));
+
   const searchInput = el('#driver-search');
   if (searchInput) {
     searchInput.addEventListener('input', (event) => {
       state.query = event.target.value;
       const resultsContainer = el('.driver-results');
+      const metaContainer = el('.driver-results-meta');
       if (resultsContainer) {
-        const filtered = state.devices.filter((device) =>
-          `${device.name} ${device.category} ${device.driver || ''}`.toLowerCase().includes(state.query.toLowerCase())
-        );
+        const currentCategory = state.selectedCategory || 'all';
+        const currentStatus = state.selectedStatus || 'all';
+        const filtered = state.devices.filter((device) => {
+          const textMatch = `${device.name} ${device.category} ${device.driver || ''} ${device.detail || ''}`.toLowerCase().includes(state.query.toLowerCase());
+          const categoryMatch = currentCategory === 'all' || device.category === currentCategory;
+          let statusMatch = true;
+          if (currentStatus === 'problem') {
+            statusMatch = device.status === 'problem' || Boolean(device.recommendation) || Boolean(device.rebootRequired);
+          } else if (currentStatus === 'ok') {
+            statusMatch = device.status === 'ok' && !device.recommendation;
+          }
+          return textMatch && categoryMatch && statusMatch;
+        });
         resultsContainer.innerHTML = renderDriverResults(filtered);
+        if (metaContainer) {
+          metaContainer.innerHTML = `
+            <span>Показано: <b>${filtered.length}</b> из <b>${state.devices.length}</b> устройств</span>
+            ${(currentCategory !== 'all' || currentStatus !== 'all' || state.query) ? '<button class="btn-link" data-action="reset-filters">Сбросить фильтры</button>' : ''}
+          `;
+          metaContainer.querySelector('[data-action="reset-filters"]')?.addEventListener('click', () => {
+            state.selectedCategory = 'all';
+            state.selectedStatus = 'all';
+            state.query = '';
+            render();
+          });
+        }
         resultsContainer.querySelectorAll('[data-install]').forEach((button) =>
           button.addEventListener('click', () => showInstall(button.dataset.install, button.dataset.device))
         );
         resultsContainer.querySelectorAll('[data-action="install-canon"]').forEach((button) =>
           button.addEventListener('click', () => startCanonInstall(state.canonSelectedModel))
+        );
+        resultsContainer.querySelectorAll('[data-reinstall]').forEach((button) =>
+          button.addEventListener('click', () => {
+            const devName = button.dataset.reinstall || '';
+            const device = state.devices.find(d => d.name === devName);
+            let pkg = device?.recommendation?.name || 'linux-firmware';
+            showInstall(pkg, devName);
+          })
         );
       }
     });

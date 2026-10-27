@@ -42,7 +42,7 @@ function readOsRelease() {
 }
 
 async function runCommand(command, args = [], timeout = COMMAND_TIMEOUT) {
-  const allowed = new Set(['lspci', 'lsusb', 'lsmod', 'modinfo', 'rfkill', 'dpkg-query', 'apt-cache', 'uname', 'lpstat', 'systemctl', 'dmesg', 'id', 'whoami', 'groups', 'lp', 'cancel', 'python3']);
+  const allowed = new Set(['lspci', 'lsusb', 'lsmod', 'modinfo', 'rfkill', 'dpkg-query', 'apt-cache', 'uname', 'lpstat', 'systemctl', 'dmesg', 'id', 'whoami', 'groups', 'lp', 'cancel', 'python3', 'udevadm']);
   if (!allowed.has(command)) throw new Error(`Команда запрещена: ${command}`);
   const candidates = [`/usr/bin/${command}`, `/usr/sbin/${command}`, `/bin/${command}`, `/sbin/${command}`];
   const executable = candidates.find(existsSync);
@@ -125,46 +125,76 @@ function parseLspci(output, osId = 'linux') {
 }
 
 function parseUsbTree(treeOutput) {
-  const driverMap = new Map();
+  const infoMap = new Map();
   let currentBus = null;
   for (const line of treeOutput.split('\n')) {
     const busMatch = line.match(/Bus\s+(\d+)/);
     if (busMatch) currentBus = parseInt(busMatch[1], 10);
-    const devMatch = line.match(/Dev\s+(\d+).*?Driver=([^,\s]+)/);
+    const devMatch = line.match(/Dev\s+(\d+)(?:,\s*If\s+\d+)?(?:,\s*Class=([^,\n]+))?.*?Driver=([^,\s]+)/);
     if (devMatch && currentBus !== null) {
       const devNum = parseInt(devMatch[1], 10);
       const key = `${currentBus}:${devNum}`;
-      const rawDriver = devMatch[2].replace(/\/\d+p$/, '');
-      if (driverMap.has(key)) {
-        const existing = driverMap.get(key);
-        if (!existing.split(', ').includes(rawDriver)) {
-          driverMap.set(key, `${existing}, ${rawDriver}`);
-        }
-      } else {
-        driverMap.set(key, rawDriver);
+      const className = (devMatch[2] || '').trim();
+      const rawDriver = (devMatch[3] || '').replace(/\/\d+p$/, '').trim();
+      if (!infoMap.has(key)) {
+        infoMap.set(key, { drivers: new Set(), classes: new Set() });
       }
+      const entry = infoMap.get(key);
+      if (rawDriver) entry.drivers.add(rawDriver);
+      if (className) entry.classes.add(className);
     }
   }
-  return driverMap;
+  const result = new Map();
+  for (const [key, data] of infoMap.entries()) {
+    result.set(key, {
+      driver: Array.from(data.drivers).join(', ') || null,
+      classes: Array.from(data.classes)
+    });
+  }
+  return result;
 }
 
 function parseLsusb(output, treeOutput = '', osId = 'linux') {
-  const driverMap = treeOutput ? parseUsbTree(treeOutput) : new Map();
+  const treeMap = treeOutput ? parseUsbTree(treeOutput) : new Map();
   return output.split('\n').filter(Boolean).map((line, index) => {
     const match = line.match(/^Bus\s+(\d+)\s+Device\s+(\d+):\s+ID\s+([0-9a-f:]+)\s+(.+)$/i);
     if (!match) return null;
     const bus = parseInt(match[1], 10);
     const dev = parseInt(match[2], 10);
-    const driver = driverMap.get(`${bus}:${dev}`) || null;
-    const [category, icon] = categoryFromText(match[4]);
+    const treeInfo = treeMap.get(`${bus}:${dev}`) || { driver: null, classes: [] };
+    const driver = treeInfo.driver;
+    const classes = treeInfo.classes || [];
+    let [category, icon] = categoryFromText(match[4]);
     const name = match[4].trim();
-    const isHub = /root hub|hub/i.test(name);
+
+    const allClasses = classes.join(' ').toLowerCase();
+    const allDrivers = (driver || '').toLowerCase();
+    if (category === 'other' || category === 'input') {
+      if (/wireless|wifi|wlan|80211|aic8800|rtw|ath9k|mt76/.test(`${allClasses} ${allDrivers}`)) {
+        category = 'network';
+        icon = '◉';
+      } else if (/audio|sound|snd-usb/.test(`${allClasses} ${allDrivers}`)) {
+        category = 'audio';
+        icon = '◖';
+      } else if (/bluetooth|btusb|bluez/.test(`${allClasses} ${allDrivers}`)) {
+        category = 'bluetooth';
+        icon = 'ᛒ';
+      } else if (/printer|cups|usblp/.test(`${allClasses} ${allDrivers}`)) {
+        category = 'printer';
+        icon = '🖶';
+      } else if (/storage|uas|usb-storage|mass storage/.test(`${allClasses} ${allDrivers}`)) {
+        category = 'storage';
+        icon = '▤';
+      }
+    }
+
+    const isHub = /root hub|hub/i.test(name) || classes.some(c => /hub/i.test(c));
     const isInput = category === 'input' || /keyboard|mouse|touchpad/i.test(name);
     const isCanon = /04a9|canon/i.test(`${match[3]} ${name}`);
     const device = {
       id: `usb-${match[3]}-${match[1]}-${match[2]}`,
       name,
-      category: isCanon ? 'printer' : isHub ? 'other' : (category === 'other' ? 'input' : category),
+      category: isCanon ? 'printer' : isHub ? 'other' : category,
       icon: isCanon ? '🖶' : isHub ? '◈' : (icon === '◈' ? '⌁' : icon),
       detail: `USB ${match[3]}`,
       driver,
@@ -178,6 +208,120 @@ function parseLsusb(output, treeOutput = '', osId = 'linux') {
     device.recommendation = (isHub || isInput) ? null : driverPackageFor(device, osId);
     return device;
   }).filter(Boolean);
+}
+
+function scanSysfsPci(osId = 'linux') {
+  const pciDir = '/sys/bus/pci/devices';
+  if (!existsSync(pciDir)) return [];
+  const devices = [];
+  try {
+    const fs = require('node:fs');
+    for (const slot of fs.readdirSync(pciDir)) {
+      const dPath = path.join(pciDir, slot);
+      try {
+        const vendor = fs.existsSync(path.join(dPath, 'vendor')) ? fs.readFileSync(path.join(dPath, 'vendor'), 'utf8').trim() : '';
+        const deviceId = fs.existsSync(path.join(dPath, 'device')) ? fs.readFileSync(path.join(dPath, 'device'), 'utf8').trim() : '';
+        const classId = fs.existsSync(path.join(dPath, 'class')) ? fs.readFileSync(path.join(dPath, 'class'), 'utf8').trim() : '';
+        let driver = null;
+        const driverLink = path.join(dPath, 'driver');
+        if (fs.existsSync(driverLink)) {
+          driver = path.basename(fs.readlinkSync(driverLink));
+        }
+        const baseClass = classId.slice(2, 4);
+        let category = 'other';
+        let icon = '◈';
+        if (baseClass === '03') { category = 'graphics'; icon = '▣'; }
+        else if (baseClass === '02') { category = 'network'; icon = '◉'; }
+        else if (baseClass === '04') { category = 'audio'; icon = '◖'; }
+        else if (baseClass === '01') { category = 'storage'; icon = '▤'; }
+        else if (baseClass === '0c') { category = 'input'; icon = '⌨'; }
+
+        const isBridge = /^(06|05|08)/.test(baseClass);
+        const name = `PCI ${vendor.replace('0x', '')}:${deviceId.replace('0x', '')} [${slot}]`;
+        const devObj = {
+          id: `pci-${slot}`,
+          name,
+          category,
+          icon,
+          detail: `PCI Class 0x${baseClass}`,
+          driver,
+          availableModule: driver,
+          version: os.release(),
+          source: 'sysfs (PCI)',
+          status: (driver || isBridge) ? 'ok' : 'problem',
+          statusText: driver ? `Работает (${driver})` : isBridge ? 'Системный мост (драйвер ядра)' : 'Драйвер не загружен',
+          recommendation: null
+        };
+        devObj.recommendation = isBridge ? null : driverPackageFor(devObj, osId);
+        devices.push(devObj);
+      } catch {}
+    }
+  } catch {}
+  return devices;
+}
+
+function scanSysfsUsb(osId = 'linux') {
+  const usbDir = '/sys/bus/usb/devices';
+  if (!existsSync(usbDir)) return [];
+  const devices = [];
+  try {
+    const fs = require('node:fs');
+    for (const name of fs.readdirSync(usbDir)) {
+      const dPath = path.join(usbDir, name);
+      try {
+        if (!fs.existsSync(path.join(dPath, 'idVendor'))) continue;
+        const vendor = fs.readFileSync(path.join(dPath, 'idVendor'), 'utf8').trim();
+        const product = fs.readFileSync(path.join(dPath, 'idProduct'), 'utf8').trim();
+        const prodName = fs.existsSync(path.join(dPath, 'product')) ? fs.readFileSync(path.join(dPath, 'product'), 'utf8').trim() : '';
+        const mfg = fs.existsSync(path.join(dPath, 'manufacturer')) ? fs.readFileSync(path.join(dPath, 'manufacturer'), 'utf8').trim() : '';
+
+        const drivers = new Set();
+        for (const sub of fs.readdirSync(dPath)) {
+          const subLink = path.join(dPath, sub, 'driver');
+          if (fs.existsSync(subLink)) {
+            try { drivers.add(path.basename(fs.readlinkSync(subLink))); } catch {}
+          }
+        }
+        const driver = drivers.size > 0 ? Array.from(drivers).join(', ') : null;
+        const fullName = [mfg, prodName].filter(Boolean).join(' ') || `USB ${vendor}:${product}`;
+        const isHub = /hub/i.test(fullName) || (vendor === '1d6b' && product === '0002');
+        let [category, icon] = categoryFromText(fullName);
+
+        if ((category === 'other' || category === 'input') && driver) {
+          if (/aic8800|wifi|wlan|80211|rtw|ath9k|mt76/i.test(driver)) {
+            category = 'network';
+            icon = '◉';
+          } else if (/snd-usb|audio|sound/i.test(driver)) {
+            category = 'audio';
+            icon = '◖';
+          } else if (/btusb|bluetooth/i.test(driver)) {
+            category = 'bluetooth';
+            icon = 'ᛒ';
+          }
+        }
+
+        const isCanon = /04a9|canon/i.test(`${vendor}:${product} ${fullName}`);
+        const isInput = category === 'input' || /keyboard|mouse|touchpad/i.test(fullName);
+
+        const devObj = {
+          id: `usb-${vendor}:${product}-${name}`,
+          name: fullName,
+          category: isCanon ? 'printer' : isHub ? 'other' : category,
+          icon: isCanon ? '🖶' : isHub ? '◈' : (icon === '◈' ? '⌁' : icon),
+          detail: `USB ${vendor}:${product}`,
+          driver,
+          version: os.release(),
+          source: 'sysfs (USB)',
+          status: isCanon && !driver ? 'recommended' : 'ok',
+          statusText: isCanon ? (driver ? `Работает (${driver})` : 'Требуется драйвер Canon LBP') : driver ? `Работает (${driver})` : (isHub || isInput) ? 'Работает корректно' : 'Устройство обнаружено',
+          recommendation: null
+        };
+        devObj.recommendation = (isHub || isInput) ? null : driverPackageFor(devObj, osId);
+        devices.push(devObj);
+      } catch {}
+    }
+  } catch {}
+  return devices;
 }
 
 function demoDevices(installedPackages = new Set()) {
@@ -198,13 +342,25 @@ async function scanDevices() {
   try {
     results.push(...parseLspci(await runCommand('lspci', ['-D', '-nnk']), osId));
     realSource = true;
-  } catch { /* optional system utility */ }
+  } catch {
+    const sysfsPci = scanSysfsPci(osId);
+    if (sysfsPci.length) {
+      results.push(...sysfsPci);
+      realSource = true;
+    }
+  }
   try {
     let treeOutput = '';
     try { treeOutput = await runCommand('lsusb', ['-t']); } catch { /* lsusb -t optional */ }
     results.push(...parseLsusb(await runCommand('lsusb'), treeOutput, osId));
     realSource = true;
-  } catch { /* optional system utility */ }
+  } catch {
+    const sysfsUsb = scanSysfsUsb(osId);
+    if (sysfsUsb.length) {
+      results.push(...sysfsUsb);
+      realSource = true;
+    }
+  }
 
   // Проверка базы установленных пакетов DPKG и очередей CUPS для корректной оценки статуса устройств
   let installedPackages = new Set();
@@ -274,7 +430,7 @@ async function systemInfo() {
   const release = readOsRelease();
   let kernel = os.release();
   try { kernel = (await runCommand('uname', ['-r'])).trim(); } catch { /* use node value */ }
-  const commands = ['lspci', 'lsusb', 'lsmod', 'modinfo', 'rfkill', 'apt-cache', 'pkexec', 'lpstat', 'systemctl'].map((name) => ({ name, available: [`/usr/bin/${name}`, `/usr/sbin/${name}`, `/bin/${name}`, `/sbin/${name}`].some(existsSync) }));
+  const commands = ['lspci', 'lsusb', 'lsmod', 'modinfo', 'rfkill', 'apt-cache', 'pkexec', 'lpstat', 'systemctl', 'udevadm'].map((name) => ({ name, available: [`/usr/bin/${name}`, `/usr/sbin/${name}`, `/bin/${name}`, `/sbin/${name}`].some(existsSync) }));
   const settings = await readSavedSettings();
   const activeKey = settings.xkiroApiKey || process.env.QWEN_API_KEY;
   const activeModel = settings.qwenModel || process.env.QWEN_MODEL || 'qwen/qwen3.8-max:free';
@@ -284,6 +440,28 @@ async function systemInfo() {
     const grp = (await runCommand('id', ['-Gn'])).trim();
     userInLp = grp.split(/\s+/).includes('lp');
   } catch {}
+
+  const displayServer = process.env.WAYLAND_DISPLAY ? 'Wayland' : (process.env.DISPLAY ? 'X11' : 'Консоль / headless');
+  const desktopEnv = process.env.XDG_CURRENT_DESKTOP || process.env.DESKTOP_SESSION || (release.ID === 'astra' ? 'Fly Desktop' : 'Linux Desktop');
+
+  let soundServer = 'ALSA';
+  const runtimeDir = process.env.XDG_RUNTIME_DIR || `/run/user/${process.getuid ? process.getuid() : 1000}`;
+  if (existsSync(path.join(runtimeDir, 'pipewire-0')) || (process.env.PULSE_SERVER && process.env.PULSE_SERVER.includes('pipewire'))) {
+    soundServer = 'PipeWire';
+  } else if (existsSync(path.join(runtimeDir, 'pulse', 'native')) || process.env.PULSE_SERVER) {
+    soundServer = 'PulseAudio';
+  }
+
+  const cpus = os.cpus() || [];
+  const cpuModel = cpus[0]?.model ? `${cpus[0].model.replace(/\s+/g, ' ').trim()} (${cpus.length} ядер)` : `${cpus.length || 1} ядра`;
+  const totalMemGb = (os.totalmem() / (1024 ** 3)).toFixed(1);
+  const freeMemGb = (os.freemem() / (1024 ** 3)).toFixed(1);
+  const usedMemGb = (parseFloat(totalMemGb) - parseFloat(freeMemGb)).toFixed(1);
+
+  const uptimeSec = os.uptime();
+  const uptimeHours = Math.floor(uptimeSec / 3600);
+  const uptimeMins = Math.floor((uptimeSec % 3600) / 60);
+  const uptimeStr = `${uptimeHours} ч ${uptimeMins} мин`;
 
   return {
     distribution: release.PRETTY_NAME || release.NAME || 'Linux',
@@ -295,8 +473,117 @@ async function systemInfo() {
     userInLpGroup: userInLp,
     rebootRequired: existsSync('/var/run/reboot-required') || existsSync('/run/reboot-required'),
     qwenConfigured: Boolean(activeKey),
-    qwenModel: activeModel
+    qwenModel: activeModel,
+    displayServer,
+    desktopEnv,
+    soundServer,
+    cpuModel,
+    memory: `${usedMemGb} / ${totalMemGb} ГБ`,
+    uptime: uptimeStr
   };
+}
+
+function generateSystemReport(info = {}, devices = [], issues = [], logs = []) {
+  const dateStr = new Date().toLocaleString('ru-RU');
+  const critical = issues.filter((i) => i.severity === 'critical');
+  const warnings = issues.filter((i) => i.severity === 'warning');
+
+  let md = `# Отчёт об оборудовании и драйверах — DriverHub Linux\n\n`;
+  md += `**Дата формирования:** ${dateStr}  \n`;
+  md += `**Хост:** ${info.hostname || os.hostname()}  \n`;
+  md += `**Дистрибутив:** ${info.distribution || 'Linux'}  \n`;
+  md += `**Ядро Linux:** ${info.kernel || os.release()} (${info.architecture || process.arch})  \n`;
+  md += `**Графический сервер:** ${info.displayServer || 'Не определён'}  \n`;
+  md += `**Рабочий стол:** ${info.desktopEnv || 'Не определён'}  \n`;
+  md += `**Звуковая подсистема:** ${info.soundServer || 'ALSA'}  \n`;
+  if (info.cpuModel) md += `**Процессор:** ${info.cpuModel}  \n`;
+  if (info.memory) md += `**Память:** ${info.memory}  \n`;
+  if (info.uptime) md += `**Время работы:** ${info.uptime}  \n`;
+  md += `**Права группы lp (печать):** ${info.userInLpGroup ? 'Настроены корректно (включён в lp)' : 'Внимание: пользователь не в группе lp'}  \n`;
+  md += `**Требуется перезагрузка:** ${info.rebootRequired ? 'ДА (пакеты ожидают перезапуска ядром)' : 'Нет'}  \n\n`;
+
+  md += `## 1. Сводка состояния системы\n\n`;
+  md += `- Всего устройств обнаружено: **${devices.length}**\n`;
+  md += `- Работают стабильно: **${devices.filter((d) => d.status === 'ok').length}**\n`;
+  md += `- Требуют драйвер / внимание: **${devices.filter((d) => d.status === 'problem' || d.recommendation).length}**\n`;
+  md += `- Критических замечаний: **${critical.length}**\n`;
+  md += `- Предупреждений: **${warnings.length}**\n\n`;
+
+  md += `## 2. Диагностика и статус драйверов\n\n`;
+  if (!issues.length) {
+    md += `Критических проблем не зафиксировано. Все модули оборудования загружены штатно.\n\n`;
+  } else {
+    for (const issue of issues) {
+      md += `### [${issue.severity ? issue.severity.toUpperCase() : 'INFO'}] ${issue.title}\n`;
+      md += `${issue.description}\n\n`;
+      if (issue.action) md += `> **Рекомендация:** ${issue.action}\n\n`;
+    }
+  }
+
+  md += `## 3. Таблица оборудования\n\n`;
+  md += `| Категория | Устройство | Идентификатор | Драйвер ядра | Статус | Рекомендация |\n`;
+  md += `| :--- | :--- | :--- | :--- | :--- | :--- |\n`;
+  for (const d of devices) {
+    const rec = d.recommendation?.name ? `${d.recommendation.name}` : '—';
+    const driver = d.driver || 'не определён';
+    md += `| ${d.category || 'other'} | ${d.name} | ${d.id || d.detail || '—'} | ${driver} | ${d.statusText || d.status} | ${rec} |\n`;
+  }
+  md += `\n`;
+
+  if (logs && logs.length) {
+    md += `## 4. Журнал системных операций DriverHub\n\n`;
+    for (const log of logs.slice(0, 15)) {
+      md += `- **[${log.timestamp || '—'}]** (${log.type || 'sys'} / ${log.status || 'ok'}): ${log.summary || '—'}\n`;
+    }
+    md += `\n`;
+  }
+
+  md += `---\n*Сформировано автоматически в DriverHub Linux — https://github.com/giddammit-crypto/driverhub*\n`;
+  return md;
+}
+
+async function executeQuickFix(type) {
+  const allowedFixes = {
+    apt_locks: {
+      title: 'Снятие блокировок APT/dpkg и настройка пакетов',
+      cmd: ['/bin/sh', '-c', 'rm -f /var/lib/dpkg/lock* /var/lib/apt/lists/lock* /var/cache/apt/archives/lock* && dpkg --configure -a']
+    },
+    restart_cups: {
+      title: 'Перезапуск службы печати CUPS',
+      cmd: ['/bin/sh', '-c', 'systemctl restart cups 2>/dev/null || systemctl restart cups.service 2>/dev/null || /etc/init.d/cups restart 2>/dev/null || true']
+    },
+    restart_ccpd: {
+      title: 'Перезапуск подсистемы Canon CAPT (CCPD)',
+      cmd: ['/bin/sh', '-c', 'systemctl restart ccpd 2>/dev/null || /etc/init.d/ccpd restart 2>/dev/null || true']
+    },
+    reload_udev: {
+      title: 'Перезагрузка правил udev и повторная инициализация шин',
+      cmd: ['/bin/sh', '-c', 'udevadm control --reload-rules && udevadm trigger']
+    },
+    unblock_rfkill: {
+      title: 'Разблокировка беспроводных модулей Wi-Fi и Bluetooth',
+      cmd: ['/bin/sh', '-c', 'rfkill unblock all 2>/dev/null || true']
+    }
+  };
+
+  const target = allowedFixes[type];
+  if (!target) {
+    throw new Error(`Неизвестное действие быстрого исправления: ${type}`);
+  }
+
+  if (existsSync('/usr/bin/pkexec')) {
+    await execFileAsync('/usr/bin/pkexec', target.cmd, {
+      timeout: 30000,
+      env: { ...process.env, DEBIAN_FRONTEND: 'noninteractive', LC_ALL: 'C' }
+    });
+  } else {
+    await execFileAsync(target.cmd[0], target.cmd.slice(1), {
+      timeout: 30000,
+      env: { ...process.env, DEBIAN_FRONTEND: 'noninteractive', LC_ALL: 'C' }
+    });
+  }
+
+  return { success: true, type, message: `${target.title} успешно выполнено.` };
 }
 
 function diagnosticsFor(devices, info) {
@@ -558,6 +845,45 @@ if (ipcMain?.handle) {
       } catch (e) {
         throw new Error(`Не удалось выполнить перезагрузку: ${e.message}`);
       }
+    }
+  });
+
+  ipcMain.handle('system:export-report', async (event) => {
+    validateIpcSender(event);
+    const info = await systemInfo();
+    const scan = await scanDevices();
+    const issues = diagnosticsFor(scan.devices, info);
+    let logs = [];
+    try { logs = JSON.parse(await readFile(path.join(app.getPath('userData'), 'operations.json'), 'utf8')); } catch {}
+    const markdown = generateSystemReport(info, scan.devices, issues, logs);
+    return { markdown, timestamp: new Date().toISOString() };
+  });
+
+  ipcMain.handle('system:save-report', async (event, payload = {}) => {
+    validateIpcSender(event);
+    const info = await systemInfo();
+    const scan = await scanDevices();
+    const issues = diagnosticsFor(scan.devices, info);
+    let logs = [];
+    try { logs = JSON.parse(await readFile(path.join(app.getPath('userData'), 'operations.json'), 'utf8')); } catch {}
+    const markdown = payload.content || generateSystemReport(info, scan.devices, issues, logs);
+    const targetPath = payload.filePath || path.join(os.homedir(), 'driverhub-report.md');
+    await writeFile(targetPath, markdown, 'utf8');
+    await logEntry({ type: 'report', status: 'success', summary: `Отчёт оборудования сохранён: ${targetPath}` });
+    return { success: true, filePath: targetPath };
+  });
+
+  ipcMain.handle('system:quick-fix', async (event, payload = {}) => {
+    validateIpcSender(event);
+    const type = String(payload.type || '').trim();
+    await logEntry({ type: 'quick-fix', status: 'started', summary: `Быстрое исправление: ${type}` });
+    try {
+      const res = await executeQuickFix(type);
+      await logEntry({ type: 'quick-fix', status: 'success', summary: `Быстрое исправление выполнено: ${type}` });
+      return res;
+    } catch (err) {
+      await logEntry({ type: 'quick-fix', status: 'error', summary: `Ошибка быстрого исправления ${type}: ${err.message}` });
+      throw err;
     }
   });
 ipcMain.handle('devices:scan', async () => { const result = await scanDevices(); await logEntry({ type: 'scan', status: 'success', summary: `Обнаружено устройств: ${result.devices.length}` }); return result; });
@@ -991,5 +1317,10 @@ module.exports = {
   driverPackageFor,
   categoryFromText,
   parseLspci,
-  parseLsusb
+  parseLsusb,
+  systemInfo,
+  generateSystemReport,
+  executeQuickFix,
+  scanSysfsPci,
+  scanSysfsUsb
 };

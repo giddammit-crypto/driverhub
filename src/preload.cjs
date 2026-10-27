@@ -4,7 +4,10 @@ const api = {
   system: {
     info: () => ipcRenderer.invoke('system:info'),
     openTerminal: () => ipcRenderer.invoke('system:open-terminal'),
-    reboot: () => ipcRenderer.invoke('system:reboot')
+    reboot: () => ipcRenderer.invoke('system:reboot'),
+    exportReport: () => ipcRenderer.invoke('system:export-report'),
+    saveReport: (payload) => ipcRenderer.invoke('system:save-report', payload || {}),
+    quickFix: (type) => ipcRenderer.invoke('system:quick-fix', { type })
   },
   devices: {
     scan: () => ipcRenderer.invoke('devices:scan')
