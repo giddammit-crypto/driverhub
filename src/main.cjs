@@ -65,27 +65,30 @@ function categoryFromText(text) {
   return ['other', '◈'];
 }
 
-function driverPackageFor(device) {
+function driverPackageFor(device, osId = 'linux') {
   const text = `${device.name} ${device.driver || ''}`.toLowerCase();
   if (text.includes('nvidia') && text.includes('nouveau')) return { name: 'nvidia-driver', reason: 'Доступен проприетарный драйвер NVIDIA' };
   if (text.includes('intel') && /wireless|wi-fi/.test(text)) return { name: 'firmware-iwlwifi', reason: 'Пакет прошивок Intel Wi‑Fi' };
   if (device.category === 'bluetooth' && !device.driver) return { name: 'bluez', reason: 'Стек Bluetooth для Linux' };
-  if (device.source === 'PCI' && !device.driver) return { name: 'linux-firmware', reason: 'Базовый пакет прошивок Linux' };
+  if (device.source === 'PCI' && !device.driver) {
+    const pkg = (osId === 'astra' || osId === 'debian') ? 'firmware-linux-nonfree' : 'linux-firmware';
+    return { name: pkg, reason: 'Базовый пакет прошивок ядра Linux' };
+  }
   return null;
 }
 
-function parseLspci(output) {
+function parseLspci(output, osId = 'linux') {
   const devices = [];
   const blocks = output.split(/\n(?=[0-9a-f]{4}:)/i).filter(Boolean);
   for (const block of blocks) {
     const first = block.split('\n')[0];
-    const match = first.match(/^([0-9a-f:.]+)\s+([^:]+):\s*(.+?)(?:\s+\[[^\]]+\])?$/i);
+    const match = first.match(/^([0-9a-f:.]+)\s+([^:]+):\s*(.+?)(?:\s+\[[^\]]+\])?(?:\s+\(rev\s+[0-9a-f]+\))?$/i);
     if (!match) continue;
     const [category, icon] = categoryFromText(`${match[2]} ${match[3]}`);
     const driverMatch = block.match(/Kernel driver in use:\s*([^\n]+)/i);
     const moduleMatch = block.match(/Kernel modules:\s*([^\n]+)/i);
     const name = match[3].trim();
-    const isBridge = /bridge/i.test(match[2]);
+    const isBridge = /bridge|host bridge|dram controller/i.test(match[2]) || /\[06[0-9a-f]{2}\]/i.test(match[2]);
     const driver = driverMatch?.[1]?.trim() || null;
     const device = {
       id: `pci-${match[1]}`,
@@ -100,7 +103,7 @@ function parseLspci(output) {
       status: (driver || isBridge) ? 'ok' : 'problem',
       statusText: driver ? 'Работает корректно' : isBridge ? 'Системный мост (драйвер ядра)' : 'Драйвер не загружен'
     };
-    device.recommendation = isBridge ? null : driverPackageFor(device);
+    device.recommendation = isBridge ? null : driverPackageFor(device, osId);
     devices.push(device);
   }
   return devices;
@@ -116,13 +119,21 @@ function parseUsbTree(treeOutput) {
     if (devMatch && currentBus !== null) {
       const devNum = parseInt(devMatch[1], 10);
       const key = `${currentBus}:${devNum}`;
-      if (!driverMap.has(key)) driverMap.set(key, devMatch[2]);
+      const rawDriver = devMatch[2].replace(/\/\d+p$/, '');
+      if (driverMap.has(key)) {
+        const existing = driverMap.get(key);
+        if (!existing.split(', ').includes(rawDriver)) {
+          driverMap.set(key, `${existing}, ${rawDriver}`);
+        }
+      } else {
+        driverMap.set(key, rawDriver);
+      }
     }
   }
   return driverMap;
 }
 
-function parseLsusb(output, treeOutput = '') {
+function parseLsusb(output, treeOutput = '', osId = 'linux') {
   const driverMap = treeOutput ? parseUsbTree(treeOutput) : new Map();
   return output.split('\n').filter(Boolean).map((line, index) => {
     const match = line.match(/^Bus\s+(\d+)\s+Device\s+(\d+):\s+ID\s+([0-9a-f:]+)\s+(.+)$/i);
@@ -137,8 +148,8 @@ function parseLsusb(output, treeOutput = '') {
     const device = {
       id: `usb-${match[3]}-${match[1]}-${match[2]}`,
       name,
-      category: category === 'other' ? 'input' : category,
-      icon: icon === '◈' ? '⌁' : icon,
+      category: isHub ? 'other' : (category === 'other' ? 'input' : category),
+      icon: isHub ? '◈' : (icon === '◈' ? '⌁' : icon),
       detail: `USB ${match[3]}`,
       driver,
       version: os.release(),
@@ -148,7 +159,7 @@ function parseLsusb(output, treeOutput = '') {
       recommendation: null,
       index
     };
-    device.recommendation = (isHub || isInput) ? null : driverPackageFor(device);
+    device.recommendation = (isHub || isInput) ? null : driverPackageFor(device, osId);
     return device;
   }).filter(Boolean);
 }
@@ -162,16 +173,18 @@ function demoDevices() {
 }
 
 async function scanDevices() {
+  const release = readOsRelease();
+  const osId = release.ID || 'linux';
   const results = [];
   let realSource = false;
   try {
-    results.push(...parseLspci(await runCommand('lspci', ['-D', '-nnk'])));
+    results.push(...parseLspci(await runCommand('lspci', ['-D', '-nnk']), osId));
     realSource = true;
   } catch { /* optional system utility */ }
   try {
     let treeOutput = '';
     try { treeOutput = await runCommand('lsusb', ['-t']); } catch { /* lsusb -t optional */ }
-    results.push(...parseLsusb(await runCommand('lsusb'), treeOutput));
+    results.push(...parseLsusb(await runCommand('lsusb'), treeOutput, osId));
     realSource = true;
   } catch { /* optional system utility */ }
   if (!results.length) return { devices: demoDevices(), demo: true, note: 'Утилиты pciutils/usbutils не найдены. Показан безопасный демонстрационный набор.' };
@@ -253,8 +266,79 @@ async function logEntry(entry) {
   await writeFile(file, JSON.stringify(entries.slice(0, 100), null, 2));
 }
 
+function validateIpcSender(event) {
+  if (mainWindow && event?.sender !== mainWindow.webContents) {
+    throw new Error('Доступ запрещён: неавторизованный отправитель IPC');
+  }
+}
+
+async function readSavedSettings() {
+  const file = path.join(app.getPath('userData'), 'settings.json');
+  try {
+    const raw = await readFile(file, 'utf8');
+    const parsed = JSON.parse(raw);
+    const result = { ...DEFAULT_SETTINGS };
+    for (const key of Object.keys(DEFAULT_SETTINGS)) {
+      if (typeof parsed[key] === typeof DEFAULT_SETTINGS[key]) {
+        result[key] = parsed[key];
+      }
+    }
+    return result;
+  } catch {
+    return { ...DEFAULT_SETTINGS };
+  }
+}
+
+async function writeSavedSettings(settings) {
+  const file = path.join(app.getPath('userData'), 'settings.json');
+  await mkdir(path.dirname(file), { recursive: true });
+  const current = await readSavedSettings();
+  if (typeof settings === 'object' && settings !== null) {
+    for (const key of Object.keys(DEFAULT_SETTINGS)) {
+      if (typeof settings[key] === typeof DEFAULT_SETTINGS[key]) {
+        current[key] = settings[key];
+      }
+    }
+  }
+  await writeFile(file, JSON.stringify(current, null, 2));
+  return current;
+}
+
 function createWindow() {
-  mainWindow = new BrowserWindow({ width: 1440, height: 940, minWidth: 900, minHeight: 650, frame: false, backgroundColor: '#121a21', webPreferences: { preload: path.join(__dirname, 'preload.cjs'), contextIsolation: true, nodeIntegration: false, sandbox: true } });
+  mainWindow = new BrowserWindow({
+    width: 1440,
+    height: 940,
+    minWidth: 900,
+    minHeight: 650,
+    frame: false,
+    backgroundColor: '#121a21',
+    webPreferences: {
+      preload: path.join(__dirname, 'preload.cjs'),
+      contextIsolation: true,
+      nodeIntegration: false,
+      nodeIntegrationInWorker: false,
+      sandbox: true,
+      webSecurity: true,
+      allowRunningInsecureContent: false
+    }
+  });
+
+  mainWindow.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
+  mainWindow.webContents.on('will-navigate', (event, navigationUrl) => {
+    try {
+      const parsedUrl = new URL(navigationUrl);
+      if (parsedUrl.protocol !== 'file:') {
+        event.preventDefault();
+      }
+    } catch {
+      event.preventDefault();
+    }
+  });
+
+  mainWindow.webContents.session.setPermissionRequestHandler((_webContents, _permission, callback) => {
+    callback(false);
+  });
+
   mainWindow.loadFile(path.join(__dirname, 'renderer', 'index.html'));
 }
 
@@ -272,7 +356,8 @@ ipcMain.handle('diagnostics:run', async (_event, options = {}) => {
   await logEntry({ type: 'diagnostics', status: issues.some((issue) => issue.severity === 'critical') ? 'warning' : 'success', summary: `Проверок: ${issues.length}`, ai: Boolean(ai && !ai.error) });
   return { info, devices: scan.devices, issues, ai, demo: scan.demo };
 });
-ipcMain.handle('drivers:install', async (_event, payload = {}) => {
+ipcMain.handle('drivers:install', async (event, payload = {}) => {
+  validateIpcSender(event);
   const allowedPackages = new Set([
     'nvidia-driver', 'firmware-iwlwifi', 'bluez', 'linux-firmware',
     'pciutils', 'usbutils', 'firmware-linux-free', 'firmware-linux-nonfree', 'firmware-misc-nonfree'
@@ -314,9 +399,17 @@ ipcMain.handle('drivers:install', async (_event, payload = {}) => {
   }
 });
 ipcMain.handle('logs:list', async () => { try { return JSON.parse(await readFile(path.join(app.getPath('userData'), 'operations.json'), 'utf8')); } catch { return []; } });
-ipcMain.handle('logs:clear', async () => { await writeFile(path.join(app.getPath('userData'), 'operations.json'), '[]'); return true; });
-ipcMain.handle('settings:get', async () => ({ ...DEFAULT_SETTINGS, aiConfigured: Boolean(process.env.QWEN_API_KEY), model: process.env.QWEN_MODEL || 'qwen/qwen3.8-max:free' }));
-ipcMain.handle('settings:save', async (_event, settings = {}) => ({ ...DEFAULT_SETTINGS, ...settings, aiConfigured: Boolean(process.env.QWEN_API_KEY), model: process.env.QWEN_MODEL || 'qwen/qwen3.8-max:free' }));
+ipcMain.handle('logs:clear', async (event) => { validateIpcSender(event); await writeFile(path.join(app.getPath('userData'), 'operations.json'), '[]'); return true; });
+ipcMain.handle('settings:get', async (event) => {
+  validateIpcSender(event);
+  const settings = await readSavedSettings();
+  return { ...settings, aiConfigured: Boolean(process.env.QWEN_API_KEY), model: process.env.QWEN_MODEL || 'qwen/qwen3.8-max:free' };
+});
+ipcMain.handle('settings:save', async (event, settings = {}) => {
+  validateIpcSender(event);
+  const saved = await writeSavedSettings(settings);
+  return { ...saved, aiConfigured: Boolean(process.env.QWEN_API_KEY), model: process.env.QWEN_MODEL || 'qwen/qwen3.8-max:free' };
+});
 
 ipcMain.on('window:minimize', () => mainWindow?.minimize());
 ipcMain.on('window:toggle-maximize', () => mainWindow?.isMaximized() ? mainWindow.unmaximize() : mainWindow?.maximize());

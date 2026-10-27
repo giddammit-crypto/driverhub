@@ -56,3 +56,19 @@ test('pkexec execution uses noninteractive APT options, lock timeout, and isolat
   assert.match(main, /error\.code === 126/);
 });
 
+test('main process restricts window opening, navigation and permissions', () => {
+  const main = read('src/main.cjs');
+  assert.match(main, /setWindowOpenHandler/);
+  assert.match(main, /will-navigate/);
+  assert.match(main, /setPermissionRequestHandler/);
+  assert.match(main, /validateIpcSender/);
+});
+
+test('renderer performs incremental DOM search and safe settings handling', () => {
+  const app = read('src/renderer/app.js');
+  assert.match(app, /renderDriverResults/);
+  assert.match(app, /resultsContainer\.innerHTML\s*=\s*renderDriverResults/);
+  assert.match(app, /DEFAULT_CLIENT_SETTINGS/);
+});
+
+
