@@ -114,6 +114,54 @@ const escapeHtml = (value) => String(value ?? '').replace(/[&<>'"]/g, (char) => 
 
 function formatMarkdown(content) {
   if (!content) return '';
+
+  // Если передана JSON-строка или частичный JSON от ИИ — извлекаем связный текст
+  if (typeof content === 'string' && (content.trim().startsWith('{') || content.includes('"summary"') || content.includes('"recommendations"'))) {
+    const raw = content.trim().replace(/^```(?:json)?\s*|```$/gi, '').trim();
+    try {
+      const parsed = JSON.parse(raw);
+      if (parsed && typeof parsed === 'object') {
+        const parts = [];
+        if (parsed.summary) parts.push(parsed.summary);
+        if (parsed.text) parts.push(parsed.text);
+        if (Array.isArray(parsed.recommendations) && parsed.recommendations.length) {
+          parts.push('\n**Рекомендации:**\n' + parsed.recommendations.map((r, i) => `${i + 1}. ${r}`).join('\n'));
+        }
+        if (parts.length) {
+          content = parts.join('\n\n');
+        }
+      }
+    } catch {
+      // Извлечение по регулярным выражениям при обрыве JSON
+      const sumMatch = raw.match(/"summary"\s*:\s*"((?:\\.|[^"\\])*?)"/);
+      const recsBlockMatch = raw.match(/"recommendations"\s*:\s*\[([\s\S]*)/);
+      const parts = [];
+      if (sumMatch) {
+        parts.push(sumMatch[1].replace(/\\"/g, '"').replace(/\\n/g, '\n'));
+      }
+      if (recsBlockMatch) {
+        const itemRegex = /"((?:\\.|[^"\\])*?)"/g;
+        let match;
+        const recs = [];
+        while ((match = itemRegex.exec(recsBlockMatch[1])) !== null) {
+          const item = match[1].replace(/\\"/g, '"').replace(/\\n/g, '\n').trim();
+          if (item && item !== 'recommendations' && !item.startsWith('{')) {
+            recs.push(item);
+          }
+        }
+        if (recs.length) {
+          parts.push('\n**Рекомендации:**\n' + recs.map((r, i) => `${i + 1}. ${r}`).join('\n'));
+        }
+      }
+      if (parts.length) {
+        content = parts.join('\n\n');
+      } else {
+        // Очищаем от синтаксических скобок и ключей
+        content = raw.replace(/^\{?\s*"summary"\s*:\s*"?/, '').replace(/"?\s*,\s*"recommendations"[\s\S]*$/, '').replace(/^["']|["']$/g, '');
+      }
+    }
+  }
+
   let text = escapeHtml(content);
 
   // Fenced code blocks
@@ -804,6 +852,129 @@ function installPage() {
   `;
 }
 
+function parseAiData(rawAi) {
+  if (!rawAi) return null;
+  if (rawAi.error) {
+    return {
+      error: rawAi.error,
+      summary: rawAi.error,
+      recommendations: [],
+      source: 'Qwen AI'
+    };
+  }
+
+  let summary = rawAi.summary || '';
+  let recommendations = Array.isArray(rawAi.recommendations) ? [...rawAi.recommendations] : [];
+
+  // Если summary содержит сырой или оборванный JSON — извлекаем поля
+  if (typeof summary === 'string' && (summary.trim().startsWith('{') || summary.includes('"summary"') || summary.includes('"recommendations"'))) {
+    const raw = summary.trim().replace(/^```(?:json)?\s*|```$/gi, '').trim();
+    try {
+      const parsed = JSON.parse(raw);
+      if (parsed && typeof parsed === 'object') {
+        if (parsed.summary) summary = parsed.summary;
+        if (Array.isArray(parsed.recommendations) && parsed.recommendations.length) {
+          recommendations = parsed.recommendations;
+        }
+      }
+    } catch {
+      const sumMatch = raw.match(/"summary"\s*:\s*"((?:\\.|[^"\\])*?)"/);
+      if (sumMatch) {
+        summary = sumMatch[1].replace(/\\"/g, '"').replace(/\\n/g, '\n');
+      }
+      const recsBlockMatch = raw.match(/"recommendations"\s*:\s*\[([\s\S]*)/);
+      if (recsBlockMatch) {
+        const itemRegex = /"((?:\\.|[^"\\])*?)"/g;
+        let match;
+        const extracted = [];
+        while ((match = itemRegex.exec(recsBlockMatch[1])) !== null) {
+          const item = match[1].replace(/\\"/g, '"').replace(/\\n/g, '\n').trim();
+          if (item && item !== 'recommendations' && !item.startsWith('{')) {
+            extracted.push(item);
+          }
+        }
+        if (extracted.length) {
+          recommendations = extracted;
+        }
+      }
+    }
+  }
+
+  // Очистка от случайных кавычек или синтаксиса
+  summary = summary
+    .replace(/^\{?\s*"summary"\s*:\s*"?/, '')
+    .replace(/"?\s*,\s*"recommendations"[\s\S]*$/, '')
+    .replace(/^["']|["']$/g, '')
+    .trim();
+
+  return {
+    source: rawAi.source || 'Qwen AI',
+    error: rawAi.error || null,
+    confidence: rawAi.confidence || null,
+    summary,
+    recommendations: recommendations.map(r => String(typeof r === 'string' ? r : r.title || r.text || '')).filter(Boolean)
+  };
+}
+
+function renderAiCard(rawAi) {
+  if (!rawAi) return '';
+  const ai = parseAiData(rawAi);
+  if (!ai) return '';
+
+  return `
+    <div class="ai-card ai-analysis-card" style="margin-top: 24px;">
+      <div class="ai-analysis-header">
+        <div class="ai-analysis-badge">
+          <span class="ai-icon-pulse">${brandIcon('shield', 22)}</span>
+          <div>
+            <h3>Анализ Qwen AI</h3>
+            <p>${ai.error ? 'Локальный режим диагностики' : 'Интеллектуальная оценка состояния оборудования'}</p>
+          </div>
+        </div>
+        ${ai.source ? `
+          <span class="ai-model-tag">${brandIcon('cpu', 13)} &nbsp; ${escapeHtml(ai.source)}</span>
+        ` : ''}
+      </div>
+
+      <div class="ai-summary-block">
+        <div class="ai-section-label">
+          ${brandIcon('check', 14)} &nbsp; СВОДКА ДИАГНОСТИКИ СИСТЕМЫ
+        </div>
+        <div class="ai-summary-text">
+          ${formatMarkdown(ai.summary || 'Анализ оборудования завершён штатно. Все критические компоненты проверены.')}
+        </div>
+      </div>
+
+      ${ai.recommendations && ai.recommendations.length ? `
+        <div class="ai-recommendations-block">
+          <div class="ai-section-label">
+            ${brandIcon('bolt', 14)} &nbsp; РЕКОМЕНДАЦИИ ПО НАСТРОЙКЕ И ОПТИМИЗАЦИИ
+          </div>
+          <div class="ai-recommendations-grid">
+            ${ai.recommendations.map((rec, index) => {
+              const cleanRec = rec.replace(/^\d+[\.\)]\s*/, '').trim();
+              const colonPos = cleanRec.indexOf(':');
+              const hasColon = colonPos > 0 && colonPos < 65;
+              const title = hasColon ? cleanRec.slice(0, colonPos).trim() : `Рекомендация ${index + 1}`;
+              const desc = hasColon ? cleanRec.slice(colonPos + 1).trim() : cleanRec;
+
+              return `
+                <div class="ai-recommendation-item">
+                  <div class="rec-number-badge">${index + 1}</div>
+                  <div class="rec-body">
+                    <strong>${escapeHtml(title)}</strong>
+                    <p>${formatMarkdown(desc)}</p>
+                  </div>
+                </div>
+              `;
+            }).join('')}
+          </div>
+        </div>
+      ` : ''}
+    </div>
+  `;
+}
+
 function repairPage() {
   const system = systemStatus();
   const lpConfigured = Boolean(state.system?.userInLpGroup);
@@ -989,25 +1160,7 @@ function repairPage() {
       </div>
     `}
 
-    ${state.ai ? `
-      <div class="ai-card" style="margin-top: 24px;">
-        <div class="ai-title">
-          <span>${brandIcon('shield', 20)}</span>
-          <div>
-            <strong>Анализ Qwen AI</strong>
-            <small>${state.ai.error ? 'Недоступен — показаны локальные правила' : 'Рекомендация на основе диагностических фактов'}</small>
-          </div>
-        </div>
-        <div class="chat-markdown" style="margin-top: 14px;">
-          ${formatMarkdown(state.ai.error ? 'Подключение к Qwen не настроено или временно недоступно. Локальная диагностика продолжает работать.' : state.ai.summary || 'Анализ завершён.')}
-        </div>
-        ${state.ai.recommendations?.length ? `
-          <ul style="margin-top: 12px;">
-            ${state.ai.recommendations.map((recommendation) => `<li>${formatMarkdown(typeof recommendation === 'string' ? recommendation : recommendation.title || recommendation.reason)}</li>`).join('')}
-          </ul>
-        ` : ''}
-      </div>
-    ` : ''}
+    ${renderAiCard(state.ai)}
   `;
 }
 

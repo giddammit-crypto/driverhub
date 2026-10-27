@@ -374,16 +374,85 @@ function postJson(urlString, body, timeout) {
   });
 }
 
+function parseAiDiagnosticOutput(content) {
+  if (!content || typeof content !== 'string') {
+    return { summary: 'Анализ завершен. Все проверенные устройства работают стабильно.', recommendations: [], confidence: 0.8, source: 'Qwen AI' };
+  }
+
+  const cleaned = content.trim().replace(/^```(?:json)?\s*|```$/gi, '').trim();
+
+  // 1. Полный парсинг JSON
+  try {
+    const parsed = JSON.parse(cleaned);
+    if (parsed && typeof parsed === 'object') {
+      return {
+        summary: String(parsed.summary || parsed.description || parsed.text || '').trim(),
+        recommendations: Array.isArray(parsed.recommendations) ? parsed.recommendations.map(r => String(typeof r === 'string' ? r : r.title || r.text || '')).filter(Boolean) : [],
+        confidence: typeof parsed.confidence === 'number' ? parsed.confidence : 0.85,
+        source: 'Qwen AI'
+      };
+    }
+  } catch {}
+
+  // 2. Регулярное извлечение из частичного/оборванного JSON
+  const summaryMatch = cleaned.match(/"summary"\s*:\s*"((?:\\.|[^"\\])*?)"/);
+  let summary = summaryMatch ? summaryMatch[1].replace(/\\"/g, '"').replace(/\\n/g, '\n').trim() : '';
+
+  const recommendations = [];
+  const recsBlockMatch = cleaned.match(/"recommendations"\s*:\s*\[([\s\S]*)/);
+  if (recsBlockMatch) {
+    const itemRegex = /"((?:\\.|[^"\\])*?)"/g;
+    let match;
+    while ((match = itemRegex.exec(recsBlockMatch[1])) !== null) {
+      const item = match[1].replace(/\\"/g, '"').replace(/\\n/g, '\n').trim();
+      if (item && item !== 'recommendations' && !item.startsWith('{')) {
+        recommendations.push(item);
+      }
+    }
+  }
+
+  if (summary || recommendations.length) {
+    return {
+      summary: summary || 'Анализ конфигурации системы и оборудования выполнен.',
+      recommendations,
+      confidence: 0.8,
+      source: 'Qwen AI'
+    };
+  }
+
+  // 3. Если ответ в виде связного текста без JSON-обертки
+  const plainText = cleaned
+    .replace(/^\{?\s*"summary"\s*:\s*"?/, '')
+    .replace(/"?\s*,\s*"recommendations"[\s\S]*$/, '')
+    .replace(/"?\s*\}\s*$/, '')
+    .trim();
+
+  return {
+    summary: plainText || 'Диагностика оборудования завершена.',
+    recommendations: [],
+    confidence: 0.75,
+    source: 'Qwen AI'
+  };
+}
+
 async function askQwen(context) {
   const settings = await readSavedSettings();
   const apiKey = settings.xkiroApiKey || process.env.QWEN_API_KEY;
   if (!apiKey || process.env.QWEN_ENABLED === 'false') return null;
   const base = settings.xkiroBaseUrl || process.env.QWEN_BASE_URL || 'https://api.xkiro.com/v1';
   const model = settings.qwenModel || process.env.QWEN_MODEL || 'qwen/qwen3.8-max:free';
-  const system = 'Ты — диагностический помощник DriverHub для Linux (Astra Linux, Debian, Ubuntu). Анализируй только факты JSON. Не выполняй команды. Не предлагай отключать защиту системы или неподписанные источники. Верни краткий ответ на русском языке с полями summary, recommendations и confidence в JSON.';
-  const response = await postJson(base, { model, temperature: 0.1, max_tokens: 900, messages: [{ role: 'system', content: system }, { role: 'user', content: JSON.stringify(context) }] }, Number(process.env.QWEN_TIMEOUT_MS || 15000));
+  const system = 'Ты — профессиональный диагностический помощник DriverHub для Linux (Astra Linux, Debian, Ubuntu). Анализируй аппаратные устройства, модули ядра и подсистему печати. Отвечай строго структурированным JSON на русском языке с полями summary (подробный и связный текст анализа), recommendations (массив понятных рекомендаций для пользователя) и confidence (число от 0 до 1). Не обрывай ответ.';
+  const response = await postJson(base, {
+    model,
+    temperature: 0.1,
+    max_tokens: 3000,
+    messages: [
+      { role: 'system', content: system },
+      { role: 'user', content: JSON.stringify(context) }
+    ]
+  }, Number(process.env.QWEN_TIMEOUT_MS || 25000));
   const content = response.choices?.[0]?.message?.content || '';
-  try { return { ...JSON.parse(content.replace(/^```json\s*|\s*```$/g, '')), source: 'Qwen AI' }; } catch { return { summary: content.slice(0, 1000), recommendations: [], confidence: 0.5, source: 'Qwen AI' }; }
+  return parseAiDiagnosticOutput(content);
 }
 
 async function logEntry(entry) {

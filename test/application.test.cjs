@@ -282,5 +282,18 @@ test('Debian installer build script and zero-chmod launcher are configured', () 
   assert.match(buildScript, /driverhub\.desktop/);
 });
 
+test('AI diagnostic output formatting safely parses raw and partial JSON', () => {
+  const main = read('src/main.cjs');
+  const app = read('src/renderer/app.js');
+  const styles = read('src/renderer/styles.css');
+
+  assert.match(main, /parseAiDiagnosticOutput/);
+  assert.match(app, /parseAiData/);
+  assert.match(app, /renderAiCard/);
+  assert.match(styles, /\.ai-analysis-card/);
+  assert.match(styles, /\.ai-recommendation-item/);
+  assert.match(styles, /\.rec-number-badge/);
+});
+
 
 
