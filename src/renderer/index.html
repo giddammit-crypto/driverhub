@@ -5,19 +5,34 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <meta name="color-scheme" content="dark" />
   <meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self'; img-src 'self' data:; connect-src 'self';" />
-  <title>DriverHub — управление драйверами Linux</title>
+  <title>Driver Hub — управление драйверами Linux</title>
+  <link rel="icon" type="image/png" href="../assets/icons/driverhub-32.png" />
   <link rel="stylesheet" href="styles.css" />
 </head>
 <body>
   <div class="app-shell">
     <header class="titlebar">
-      <div class="brand-mini"><span class="brand-mark small">✧</span><div><strong>DriverHub</strong><span>Управление драйверами и исправление проблем системы</span></div></div>
-      <div class="window-controls"><button aria-label="Свернуть" data-window="minimize">−</button><button aria-label="Развернуть" data-window="maximize">□</button><button class="close" aria-label="Закрыть" data-window="close">×</button></div>
+      <div class="brand-mini">
+        <img src="../assets/icons/driverhub-48.png" class="brand-app-icon" alt="Driver Hub Logo" />
+        <div>
+          <strong>Driver <b>Hub</b></strong>
+          <span>Инженерный менеджер оборудования и драйверов Linux</span>
+        </div>
+      </div>
+      <div class="window-controls">
+        <button aria-label="Свернуть" data-window="minimize">−</button>
+        <button aria-label="Развернуть" data-window="maximize">□</button>
+        <button class="close" aria-label="Закрыть" data-window="close">×</button>
+      </div>
     </header>
     <div class="workspace">
       <aside class="sidebar">
         <nav id="navigation"></nav>
-        <div class="sidebar-foot"><div class="tux">🐧</div><p>Для стабильной<br />и быстрой работы<br />вашей системы</p><small>v0.1.0 MVP</small></div>
+        <div class="sidebar-foot">
+          <img src="../assets/icons/driverhub-64.png" class="foot-gear-icon" alt="Driver Hub" />
+          <p>Точность, стабильность<br />и контроль ядра Linux</p>
+          <small>Driver Hub v1.0 Production</small>
+        </div>
       </aside>
       <main class="content" id="app"></main>
     </div>

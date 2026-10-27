@@ -9,7 +9,8 @@
   "scripts": {
     "start": "electron --no-sandbox .",
     "test": "node --test test/**/*.test.cjs",
-    "check": "node --check src/main.cjs && node --check src/preload.cjs && node --check src/renderer/app.js"
+    "check": "node --check src/main.cjs && node --check src/preload.cjs && node --check src/canon-lbp-setup.cjs && node --check src/installer.cjs && node --check src/agent-engine.cjs && node --check src/renderer/app.js",
+    "build:deb": "node scripts/build-deb.cjs"
   },
   "devDependencies": {
     "electron": "^32.2.7"
